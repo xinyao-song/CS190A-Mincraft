@@ -1,211 +1,224 @@
 import cv2
-import numpy as np
 import mediapipe as mp
+import numpy as np
 import pyautogui
 import time
-import os
-from collections import deque
-import subprocess
-
-# Suppress AVFoundation warnings (macOS specific)
-os.environ['OPENCV_AVFOUNDATION_SKIP_AUTH'] = '1'
-os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
 
 # Initialize MediaPipe Hands
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
-    max_num_hands=1,
+    static_image_mode=False,
+    max_num_hands=2,  # Changed to detect up to 2 hands
     min_detection_confidence=0.7,
-    min_tracking_confidence=0.5)
-mp_drawing = mp.solutions.drawing_utils
+    min_tracking_confidence=0.5
+)
+mp_draw = mp.solutions.drawing_utils
 
-# Hand gesture to key mapping
-GESTURE_TO_KEY = {
-    'fist': 'w',        # Closed fist for forward
-    'palm_up': 's',     # Open palm facing up for backward
-    'peace': 'a',       # Peace sign (index+middle) for left
-    'thumbs_up': 'd',   # Thumbs up for right
-    'point_up': 'space'  # Index finger pointing up for jump
-}
+# Initialize the webcam
+cap = cv2.VideoCapture(0)
 
-# Motion detection parameters
-MOTION_HISTORY_LENGTH = 10
-motion_history = deque(maxlen=MOTION_HISTORY_LENGTH)
-DEBOUNCE_TIME = 0.5
-last_key_time = 0
+# Minecraft control keys
+FORWARD_KEY = 'w'
+BACKWARD_KEY = 's'
+LEFT_KEY = 'a'
+RIGHT_KEY = 'd'
+JUMP_KEY = 'space'
+MOUSE_LEFT = 'left'
 
-def focus_minecraft():
-    """Focus the Minecraft window using AppleScript"""
-    try:
-        # AppleScript to focus Minecraft
-        script = '''
-        tell application "System Events"
-            set frontProcess to first process whose name contains "Minecraft"
-            set frontmost of frontProcess to true
-        end tell
-        '''
-        subprocess.run(['osascript', '-e', script])
-        return True
-    except:
-        return False
-
-def initialize_camera():
-    """Initialize the MacBook camera with proper settings"""
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        # Try different camera indices if 0 doesn't work
-        for i in range(1, 3):
-            cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                break
+def is_hand_open(landmarks):
+    """Check if all fingers are extended (open hand)"""
+    finger_tips = [8, 12, 16, 20]  # Index, middle, ring, pinky tips
+    finger_mcps = [6, 10, 14, 18]  # Corresponding MCP joints
     
-    if not cap.isOpened():
-        raise RuntimeError("Could not open camera. Check permissions.")
+    for tip, mcp in zip(finger_tips, finger_mcps):
+        if landmarks[tip].y > landmarks[mcp].y:  # If tip is below MCP, finger is not extended
+            return False
+    return True
+
+def is_fist(landmarks):
+    """Check if all fingers are closed (fist)"""
+    finger_tips = [8, 12, 16, 20]  # Index, middle, ring, pinky tips
+    finger_mcps = [6, 10, 14, 18]  # Corresponding MCP joints
     
-    # Set optimal resolution
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-    
-    return cap
+    for tip, mcp in zip(finger_tips, finger_mcps):
+        if landmarks[tip].y < landmarks[mcp].y:  # If tip is above MCP, finger is extended
+            return False
+    return True
 
-def get_hand_landmarks(image):
-    """Process image and return hand landmarks"""
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = hands.process(image_rgb)
-    return results.multi_hand_landmarks
+def is_index_up(landmarks):
+    """Check if only index finger is up"""
+    # Index finger up, others down
+    if landmarks[8].y < landmarks[6].y:  # Index finger up
+        if landmarks[12].y > landmarks[10].y:  # Middle finger down
+            if landmarks[16].y > landmarks[14].y:  # Ring finger down
+                if landmarks[20].y > landmarks[18].y:  # Pinky down
+                    return True
+    return False
 
-def is_finger_extended(tip, base, threshold=0.1):
-    """Check if a finger is extended"""
-    return tip.y < base.y - threshold
+def is_peace_sign(landmarks):
+    """Check if index and middle fingers are up (peace sign)"""
+    # Index and middle fingers up, others down
+    if landmarks[8].y < landmarks[6].y:  # Index finger up
+        if landmarks[12].y < landmarks[10].y:  # Middle finger up
+            if landmarks[16].y > landmarks[14].y:  # Ring finger down
+                if landmarks[20].y > landmarks[18].y:  # Pinky down
+                    return True
+    return False
 
-def detect_gesture(landmarks):
-    """Detect hand gestures based on landmarks"""
+def is_three_fingers_up(landmarks):
+    """Check if index, middle, and ring fingers are up"""
+    # Index, middle, and ring fingers up, pinky down
+    if landmarks[8].y < landmarks[6].y:  # Index finger up
+        if landmarks[12].y < landmarks[10].y:  # Middle finger up
+            if landmarks[16].y < landmarks[14].y:  # Ring finger up
+                if landmarks[20].y > landmarks[18].y:  # Pinky down
+                    return True
+    return False
+
+def is_shaka(landmarks):
+    """Check if only thumb and pinky are extended (shaka/hang loose gesture)"""
+    # Thumb extended (pointing to the right in the camera view)
+    if landmarks[4].x > landmarks[3].x:  # Thumb tip is to the right of thumb MCP
+        # Pinky extended
+        if landmarks[20].y < landmarks[18].y:  # Pinky up
+            # Other fingers down
+            if landmarks[8].y > landmarks[6].y:  # Index finger down
+                if landmarks[12].y > landmarks[10].y:  # Middle finger down
+                    if landmarks[16].y > landmarks[14].y:  # Ring finger down
+                        return True
+    return False
+
+def is_thumbs_down(landmarks):
+    """Check if thumb is down and other fingers are closed"""
+    # Thumb down (pointing to the left in the camera view)
+    if landmarks[4].x < landmarks[3].x:  # Thumb tip is to the left of thumb MCP
+        # Check if other fingers are closed
+        if landmarks[8].y > landmarks[6].y:  # Index finger down
+            if landmarks[12].y > landmarks[10].y:  # Middle finger down
+                if landmarks[16].y > landmarks[14].y:  # Ring finger down
+                    if landmarks[20].y > landmarks[18].y:  # Pinky down
+                        return True
+    return False
+
+def process_hand_gesture(landmarks):
+    """Process hand landmarks and determine the gesture for a single hand"""
     if not landmarks:
         return None
     
-    landmarks = landmarks[0].landmark
-    thumb_tip = landmarks[4]
-    index_tip = landmarks[8]
-    middle_tip = landmarks[12]
-    ring_tip = landmarks[16]
-    pinky_tip = landmarks[20]
+    # Check for each gesture in order of priority
+    if is_thumbs_down(landmarks):
+        return 'stop'
+    elif is_hand_open(landmarks):
+        return 'forward'
+    elif is_fist(landmarks):
+        return 'backward'
+    elif is_index_up(landmarks):
+        return 'left'
+    elif is_peace_sign(landmarks):
+        return 'right'
+    elif is_three_fingers_up(landmarks):
+        return 'mouse_left'
+    elif is_shaka(landmarks):
+        return 'jump'
     
-    # Get finger base positions
-    thumb_base = landmarks[2]
-    index_base = landmarks[5]
-    middle_base = landmarks[9]
-    ring_base = landmarks[13]
-    pinky_base = landmarks[17]
-    
-    # Check finger extensions
-    index_extended = is_finger_extended(index_tip, index_base)
-    middle_extended = is_finger_extended(middle_tip, middle_base)
-    ring_extended = is_finger_extended(ring_tip, ring_base)
-    pinky_extended = is_finger_extended(pinky_tip, pinky_base)
-    thumb_extended = is_finger_extended(thumb_tip, thumb_base)
-    
-    # Count extended fingers
-    fingers_extended = sum([index_extended, middle_extended, ring_extended, pinky_extended])
-    
-    # Fist (W) - All fingers closed
-    if (not index_extended and not middle_extended and 
-        not ring_extended and not pinky_extended and not thumb_extended):
-        return 'fist'
-    
-    # Palm Up (S) - All fingers extended, palm up
-    if (index_extended and middle_extended and 
-        ring_extended and pinky_extended and
-        thumb_extended):  # Palm facing up
-        return 'palm_up'
-    
-    # Peace Sign (A) - Only index and middle fingers up
-    if (index_extended and middle_extended and 
-        not ring_extended and not pinky_extended and not thumb_extended):
-        return 'peace'
-    
-    # Thumbs Up (D) - Only thumb up
-    if (thumb_extended and not index_extended and 
-        not middle_extended and not ring_extended and 
-        not pinky_extended):
-        return 'thumbs_up'
-    
-    # Point Down (Space) - Only index finger pointing down
-    if (not thumb_extended and index_extended and 
-        not middle_extended and not ring_extended and 
-        not pinky_extended):  # Index finger pointing down
-        return 'point_up'
-    
-    return None
-
-def send_key(key):
-    """Send keyboard input with debouncing"""
-    global last_key_time
-    current_time = time.time()
-    if current_time - last_key_time > DEBOUNCE_TIME:
-        # Focus Minecraft window before sending key
-        if focus_minecraft():
-            pyautogui.press(key)
-            last_key_time = current_time
-            print(f"Pressed key: {key}")
-        else:
-            print("Minecraft window not found!")
+    return 'stop'
 
 def main():
-    print("Starting Minecraft gesture control...")
-    print("Make sure Minecraft is running and in focus!")
-    print("Press 'q' to quit the gesture control")
+    print("Starting Minecraft Gesture Control...")
+    print("Press 'q' to quit")
+    print("\nGesture Guide:")
+    print("Open Hand: Move Forward")
+    print("Fist: Move Backward")
+    print("Index Finger Up: Move Left")
+    print("Peace Sign: Move Right")
+    print("Three Fingers Up: Left Mouse Click")
+    print("Shaka (Thumb + Pinky): Jump")
+    print("Thumbs Down: Stop All Actions")
+    print("No Hand/Other Gestures: Stop")
+    print("\nYou can use both hands simultaneously!")
+    print("Example: Open hand + Shaka = Walk forward while jumping")
     
-    cap = initialize_camera()
-    
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("Camera disconnected or frame read failed")
-                time.sleep(1)
-                cap.release()
-                cap = initialize_camera()
-                continue
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
             
-            frame = cv2.flip(frame, 1)
-            
-            landmarks = get_hand_landmarks(frame)
-            
-            if landmarks:
-                # Draw landmarks
-                for hand_landmarks in landmarks:
-                    mp_drawing.draw_landmarks(
-                        frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+        # Flip the frame horizontally for a later selfie-view display
+        frame = cv2.flip(frame, 1)
+        
+        # Convert the BGR image to RGB
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Process the frame and detect hands
+        results = hands.process(rgb_frame)
+        
+        # Initialize active gestures set
+        active_gestures = set()
+        
+        if results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
+                # Draw hand landmarks on the frame
+                mp_draw.draw_landmarks(
+                    frame, 
+                    hand_landmarks, 
+                    mp_hands.HAND_CONNECTIONS
+                )
                 
-                gesture = detect_gesture(landmarks)
+                # Process the gesture for this hand
+                gesture = process_hand_gesture(hand_landmarks.landmark)
                 if gesture:
-                    motion_history.append(gesture)
-                    
-                    if len(motion_history) == MOTION_HISTORY_LENGTH:
-                        most_common = max(set(motion_history), key=motion_history.count)
-                        if motion_history.count(most_common) > MOTION_HISTORY_LENGTH * 0.7:
-                            key = GESTURE_TO_KEY.get(most_common)
-                            if key:
-                                send_key(key)
-            
-            # Add instruction text to the frame
-            cv2.putText(frame, "Minecraft Controls:", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(frame, "W: Fist (all fingers closed)", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(frame, "S: Open palm facing up", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(frame, "A: Peace sign (index+middle up)", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(frame, "D: Thumbs up", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(frame, "Space: Index finger pointing up", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            cv2.imshow('Minecraft Gesture Control', frame)
-            if cv2.waitKey(10) & 0xFF == ord('q'):
-                break
-                
-    except KeyboardInterrupt:
-        pass
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
+                    active_gestures.add(gesture)
+        
+        # Release all keys first
+        pyautogui.keyUp(FORWARD_KEY)
+        pyautogui.keyUp(BACKWARD_KEY)
+        pyautogui.keyUp(LEFT_KEY)
+        pyautogui.keyUp(RIGHT_KEY)
+        pyautogui.keyUp(JUMP_KEY)
+        pyautogui.mouseUp(button=MOUSE_LEFT)
+        
+        # If thumbs down is detected, stop all actions
+        if 'stop' in active_gestures:
+            active_gestures.clear()
+        else:
+            # Apply all active gestures
+            for gesture in active_gestures:
+                if gesture == 'forward':
+                    pyautogui.keyDown(FORWARD_KEY)
+                elif gesture == 'backward':
+                    pyautogui.keyDown(BACKWARD_KEY)
+                elif gesture == 'left':
+                    pyautogui.keyDown(LEFT_KEY)
+                elif gesture == 'right':
+                    pyautogui.keyDown(RIGHT_KEY)
+                elif gesture == 'jump':
+                    pyautogui.keyDown(JUMP_KEY)
+                elif gesture == 'mouse_left':
+                    pyautogui.mouseDown(button=MOUSE_LEFT)
+        
+        # Display active gestures
+        gesture_text = "Active Gestures: " + ", ".join(active_gestures) if active_gestures else "No active gestures"
+        cv2.putText(
+            frame,
+            gesture_text,
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 255, 0),
+            2
+        )
+        
+        # Display the frame
+        cv2.imshow('Minecraft Gesture Control', frame)
+        
+        # Break the loop if 'q' is pressed
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    
+    # Release resources
+    cap.release()
+    cv2.destroyAllWindows()
+    hands.close()
 
 if __name__ == "__main__":
-    main()
+    main() 
